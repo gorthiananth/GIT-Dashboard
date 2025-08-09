@@ -1,20 +1,38 @@
+// server.js
+/**
+ * Cloudpulse Git UI Backend - consolidated and optimized
+ *
+ * Improvements:
+ * - Single source of truth for branch parsing
+ * - Async exec usage (no blocking execSync in request handlers)
+ * - Proper caches for branches and specs, with TTL and refresh lock
+ * - DRY .env writer
+ * - Fixed endpoints (stash, create-branch, pull, run-automation, etc.)
+ * - Safer handling of user input (simple validation + escaping)
+ *
+ * Note: Adjust CACHE_TTL_MS / SPECS_CACHE_TTL and buffers as needed.
+ */
+
 const express = require('express');
 const cors = require('cors');
-const { exec, execSync, spawn } = require('child_process');
+const { exec: execCb } = require('child_process');
 const util = require('util');
 const bodyParser = require('body-parser');
 const path = require('path');
 const fs = require('fs');
-const { glob } = require('glob')	
+const { glob } = require('glob');
 
 require('dotenv').config({ path: path.resolve(__dirname, '../frontend/.env') });
-const execAsync = util.promisify(exec);
-const port = process.env.Backendport;  // Ensure this matches your frontend's API_URL port
-const repoPath = process.env.REPO_PATH;
-//const repoPath = '/Users/agorthi/Downloads/repo/manager';
+
+const exec = util.promisify(execCb);
+const port = process.env.Backendport || 4000;
+const repoPath = process.env.REPO_PATH || path.resolve('/Users/agorthi/Downloads/repo/manager'); // fallback to your local path
 const localPackagesEnvFile = path.resolve('./packages/manager/.env');
 const localPackagesEnvDir = path.dirname(localPackagesEnvFile);
+const managerPath = path.join(repoPath, 'packages/manager');
+const relRoot = 'cypress/e2e/core/cloudpulse';
 
+const MAX_EXEC_BUFFER = 10 * 1024 * 1024; // 10MB
 
 const REACT_ENVS = {
   prod: {
@@ -54,376 +72,408 @@ const REACT_ENVS = {
     MANAGER_OAUTH: 'b082b2eacf82592994c66fab256f28a02d2ccfd74a65b3ed6182f28320e94d1e',
   }
 };
-// Initialize Express app
-const app = express();
-// Middleware to enable CORS and parse JSON bodies
-app.use(cors());
-app.use(express.json());
 
+// Express app
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// Utilities
 function formatEnv(config) {
   return Object.entries(config)
     .map(([key, value]) => {
       if (typeof value === 'string') {
-        value = value.trim().replace(/%$/, ''); // Trim whitespace and remove trailing %
+        value = value.trim().replace(/%$/, ''); // Trim and drop trailing %
       }
       return `${key}='${value}'`;
     })
     .join('\n');
 }
+
 function replacePlaceholders(template, values) {
   return template.replace(/{{(.*?)}}/g, (_, key) => values[key] || '');
 }
 
+/**
+ * Simple shell argument escaper for single-argument usage
+ * NOTE: Not a replacement for proper shell utilities in complex cases
+ */
+function shellEscapeArg(arg = '') {
+  return `'${String(arg).replace(/'/g, `'\\''`)}'`;
+}
 
-app.get('/env', (req, res) => {
+// ----------------- GIT Helpers (async) -----------------
+
+async function execGit(cmd, cwd = repoPath, opts = {}) {
+  const options = { cwd, maxBuffer: MAX_EXEC_BUFFER, ...opts };
   try {
-    const env = req.query.env || 'alpha';
+    const { stdout, stderr } = await exec(cmd, options);
+    return { stdout: stdout.toString(), stderr: stderr ? stderr.toString() : '' };
+  } catch (err) {
+    // err may have stdout/stderr or message
+    const stdout = (err.stdout || '').toString();
+    const stderr = (err.stderr || err.message || '').toString();
+    throw new Error(stderr || stdout || err.message);
+  }
+}
+
+async function getRemotesAsync(repo) {
+  try {
+    const { stdout } = await execGit('git remote', repoPath);
+    return stdout.split('\n').map(s => s.trim()).filter(Boolean);
+  } catch (err) {
+    console.error('getRemotesAsync error:', err.message || err);
+    return [];
+  }
+}
+
+function parseGitDateISO(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString('en-US', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).replace(',', '');
+}
+
+/**
+ * Parse reflog "branch: Created from ..." lines or a variety of formats
+ * We'll attempt to extract a date/time if present. If not, return null.
+ */
+function parseGitReflogDate(reflogLine) {
+  if (!reflogLine) return null;
+  // Example patterns: "Jan 02, 2024, 15:04" or full ISO in braces from reflog
+  const isoMatch = reflogLine.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  if (isoMatch) return new Date(isoMatch[0]);
+  const friendlyMatch = reflogLine.match(/([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4}),\s+(\d{2}):(\d{2})/);
+  if (!friendlyMatch) return null;
+  const [, monthStr, day, year, hour, minute] = friendlyMatch;
+  const monthMap = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
+  const month = monthMap[monthStr] ?? 0;
+  return new Date(Number(year), month, Number(day), Number(hour), Number(minute));
+}
+
+/**
+ * Extract 'createdFrom' for a branch name.
+ * Prefer upstream tracking (if available elsewhere), but fallback to 'prefix' before slash.
+ */
+function extractCreatedFromFromName(branchName) {
+  if (!branchName) return '';
+  // If branch name contains slash, common pattern origin/branchName
+  const parts = branchName.split('/');
+  if (parts.length > 1 && parts[0]) return parts[0];
+  // Fallback: try regex _remotename_More_... pattern (older style)
+  const m = branchName.match(/_([a-zA-Z0-9\-_]+)_/);
+  return m ? m[1] : '';
+}
+
+// ----------------- Branch & Specs Caching -----------------
+
+let cachedBranches = [];
+let branchesCacheTS = 0;
+let branchesRefreshing = false;
+
+let cachedSpecs = [];
+let specsCacheTS = 0;
+let specsRefreshing = false;
+
+const BRANCH_CACHE_TTL = 30 * 1000; // 30s
+const SPECS_CACHE_TTL = 60 * 1000; // 60s
+
+async function refreshBranchesCache() {
+  if (branchesRefreshing) return; // already running
+  branchesRefreshing = true;
+  try {
+    // Get all branch names
+    const { stdout: branchNamesOut } = await execGit(`git for-each-ref --format="%(refname:short)" refs/heads`, repoPath);
+    const names = branchNamesOut.trim().split('\n').map(s => s.trim()).filter(Boolean);
+
+    const remotes = await getRemotesAsync();
+
+    const results = [];
+
+    for (const name of names) {
+      try {
+        // createdAt: first commit date (ISO)
+        const { stdout: createdAtRaw } = await execGit(`git log --reverse --format="%aI" ${name} | head -1`, repoPath);
+        const createdAt = parseGitDateISO(createdAtRaw.trim());
+
+        // reflog line: grab one that mentions "branch: Created from" if present
+        let reflogDate = '';
+        try {
+          const { stdout: reflogOut } = await execGit(
+            `git reflog show ${name} --date=format:'%b %d, %Y, %H:%M' | grep "branch: Created from" | head -1`,
+            repoPath
+          );
+          const match = reflogOut.trim();
+          const parsed = parseGitReflogDate(match);
+          reflogDate = parsed ? parseGitDateISO(parsed.toISOString()) : '';
+        } catch (_) {
+          reflogDate = '';
+        }
+
+        // try to determine upstream/tracking
+        let createdFrom = '';
+        try {
+          const { stdout: up } = await execGit(
+            `git for-each-ref --format='%(upstream:short)' refs/heads/${name}`,
+            repoPath
+          );
+          createdFrom = (up || '').trim();
+        } catch (_) {
+          createdFrom = '';
+        }
+        if (!createdFrom) {
+          createdFrom = extractCreatedFromFromName(name);
+        }
+
+        results.push({
+          name,
+          createdAt: createdAt || '',
+          date: reflogDate || '',
+          createdFrom
+        });
+      } catch (err) {
+        console.error(`Error processing branch ${name}:`, (err && err.message) || err);
+        results.push({ name, createdAt: '', date: '', createdFrom: '' });
+      }
+    }
+
+    cachedBranches = results;
+    branchesCacheTS = Date.now();
+    // console.log(`[cache] branches updated: ${cachedBranches.length}`);
+  } catch (err) {
+    console.error('refreshBranchesCache error:', err.message || err);
+  } finally {
+    branchesRefreshing = false;
+  }
+}
+
+async function refreshSpecsCache() {
+  if (specsRefreshing) return;
+  specsRefreshing = true;
+  try {
+    const files = await glob(`${relRoot}/**/*.spec.{ts,js}`, { cwd: managerPath });
+    cachedSpecs = files || [];
+    specsCacheTS = Date.now();
+    // console.log(`[cache] specs updated: ${cachedSpecs.length}`);
+  } catch (err) {
+    console.error('refreshSpecsCache error:', err.message || err);
+  } finally {
+    specsRefreshing = false;
+  }
+}
+
+// Kick off initial refresh
+(async () => {
+  await Promise.all([refreshBranchesCache(), refreshSpecsCache()]);
+  // schedule periodic refresh as a soft background refresh
+  setInterval(() => {
+    if (Date.now() - branchesCacheTS > BRANCH_CACHE_TTL) refreshBranchesCache();
+    if (Date.now() - specsCacheTS > SPECS_CACHE_TTL) refreshSpecsCache();
+  }, Math.min(BRANCH_CACHE_TTL, SPECS_CACHE_TTL));
+})();
+
+// ----------------- Routes -----------------
+
+/** /env - write environment files for chosen env */
+app.get('/env', async (req, res) => {
+  try {
+    const env = (req.query.env || 'prod').toString();
     const config = REACT_ENVS[env];
+    if (!config) {
+      return res.status(400).json({ success: false, error: `Unknown env '${env}'` });
+    }
 
-    if (!config) throw new Error(`No config for env: ${env}`);
-
-    // 1) Create repo .env at /Users/agorthi/Downloads/repo/manager/.env
     const repoEnvFile = path.join(repoPath, '.env');
-    fs.writeFileSync(repoEnvFile, formatEnv(config), 'utf8');
-    console.log(`Created .env at repo root: ${repoEnvFile}`);
-
-    // 2) Copy to ./packages/manager/.env relative inside repoPath (like cd into repoPath)
     const repoPackagesDir = path.join(repoPath, 'packages', 'manager');
     const repoPackagesEnvFile = path.join(repoPackagesDir, '.env');
-    if (!fs.existsSync(repoPackagesDir)) {
-      fs.mkdirSync(repoPackagesDir, { recursive: true });
-      console.log(`Created directory: ${repoPackagesDir}`);
-    }
-    if (fs.existsSync(repoPackagesEnvFile)) {
-      fs.unlinkSync(repoPackagesEnvFile);
-      console.log(`Removed existing .env at repo packages path: ${repoPackagesEnvFile}`);
-    }
-    fs.copyFileSync(repoEnvFile, repoPackagesEnvFile);
-    console.log(`Copied .env inside repo at: ${repoPackagesEnvFile}`);
 
-    // 3) Copy to local backend ./packages/manager/.env (relative to current cwd)
-    if (!fs.existsSync(localPackagesEnvDir)) {
-      fs.mkdirSync(localPackagesEnvDir, { recursive: true });
-      console.log(`Created local packages directory: ${localPackagesEnvDir}`);
-    }
-    if (fs.existsSync(localPackagesEnvFile)) {
-      fs.unlinkSync(localPackagesEnvFile);
-      console.log(`Removed existing local .env at: ${localPackagesEnvFile}`);
-    }
-    fs.copyFileSync(repoEnvFile, localPackagesEnvFile);
-    console.log(`Copied .env to local backend path: ${localPackagesEnvFile}`);
+    const destinations = [
+      { dir: repoPath, file: repoEnvFile },
+      { dir: repoPackagesDir, file: repoPackagesEnvFile },
+      { dir: localPackagesEnvDir, file: localPackagesEnvFile },
+    ];
 
-    // Log contents
-    console.log(`Contents of repo root .env:\n${fs.readFileSync(repoEnvFile, 'utf8')}`);
-    console.log(`Contents of repo packages .env:\n${fs.readFileSync(repoPackagesEnvFile, 'utf8')}`);
-    console.log(`Contents of local backend packages .env:\n${fs.readFileSync(localPackagesEnvFile, 'utf8')}`);
+    const contents = formatEnv(config);
 
-    // Export line for token
+    for (const dest of destinations) {
+      if (!fs.existsSync(dest.dir)) fs.mkdirSync(dest.dir, { recursive: true });
+      if (fs.existsSync(dest.file)) fs.unlinkSync(dest.file);
+      fs.writeFileSync(dest.file, contents, 'utf8');
+      console.log(`Wrote .env to ${dest.file}`);
+    }
+
+    // Optional export line
     const CYPRESS_MANAGER_OAUTH = config.CYPRESS_MANAGER_OAUTH || config.MANAGER_OAUTH;
     if (CYPRESS_MANAGER_OAUTH) {
       console.log(`export CYPRESS_MANAGER_OAUTH='${CYPRESS_MANAGER_OAUTH}'`);
-    } else {
-      console.warn('No CYPRESS_MANAGER_OAUTH or MANAGER_OAUTH found in config');
     }
 
-    res.json({ envKey: env, config });
-  } catch (error) {
-    console.error('Error in /env:', error);
-    res.status(500).json({ error: 'Could not generate env.' });
-  }
-});
-
-
-
-
-// Fetch remotes dynamically from Git repo
-
-function getRemotes(repoPath) {
-  try {
-    const remotesOutput = execSync('git remote', { cwd: repoPath }).toString().trim();
-    const remotes = remotesOutput.split('\n').map(r => r.trim()).filter(Boolean);
-    return remotes;
+    res.json({ success: true, message: `Environment file(s) written for '${env}'`, envKey: env, config });
   } catch (err) {
-    console.error('Failed to fetch git remotes:', err);
-    return [];
+    console.error('/env error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Failed to write env files' });
   }
-}
+});
 
-// Dynamically build regex for remotes to parse createdFrom from branch name
-
-const remotes = getRemotes(repoPath);
-
-const remotesPattern = remotes.length > 0 ? remotes.join('|') : '';
-
-const remoteRegex = remotesPattern ? new RegExp(`_(${remotesPattern})_[A-Za-z]+_\\d+$`) : null;
-
-
-
-function extractCreatedFrom(branchName) {
-
-  if (remoteRegex) {
-
-    const match = branchName.match(remoteRegex);
-
-    return match ? match[1] : '';
-
-  }
-
-  return '';
-
-}
-
-/** ----------get  remotes ---------- **/
-
-app.get('/remotes', (req, res) => {
+/** /remotes - list git remotes */
+app.get('/remotes', async (req, res) => {
   try {
-    const remotes = getRemotes(repoPath);
-    console.log("Remotes sent to frontend:", remotes); // DEBUG LOG
-    res.json({ remotes });
+    const remotes = await getRemotesAsync(repoPath);
+    res.json({ success: true, remotes });
   } catch (err) {
-    console.error('Failed to fetch git remotes:', err);
-    res.status(500).json({ error: 'Could not fetch remotes.' });
+    console.error('/remotes error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Failed to fetch remotes' });
   }
 });
 
-
-/** ---------- Branch info & cache utils ---------- **/
-
-function getAllBranchNames() {
-  const cmd = `git for-each-ref --format="%(refname:short)" refs/heads`;
+/** /branches - return cached branches (refreshed if TTL expired) */
+app.get('/branches', async (req, res) => {
   try {
-    const output = execSync(cmd, { cwd: repoPath }).toString().trim();
-    return output ? output.split('\n') : [];
-  } catch (error) {
-    console.error(`Error in getAllBranchNames: ${error.message}`);
-    return [];
-  }
-}
-
-function getBranchesWithCreationDate() {
-  const branchNames = getAllBranchNames();
-  return branchNames.map((name) => {
-    try {
-      const firstCommitDate = execSync(
-        `git log --reverse --format="%aI" ${name} | head -1`, { cwd: repoPath }
-      ).toString().trim();
-      const lastCommitDate = execSync(
-        `git log -1 --format="%cI" ${name}`, { cwd: repoPath }
-      ).toString().trim();
-      
-      // Get upstream branch (remote/branch)
-      let createdFrom = '';
-      try {
-        createdFrom = execSync(
-          `git for-each-ref --format='%(upstream:short)' refs/heads/${name}`, 
-          { cwd: repoPath }
-        ).toString().trim();
-      } catch (_) {
-        createdFrom = '';
-      }
-
-      // fallback to parsing from branchName if upstream missing
-      if (!createdFrom) createdFrom = extractCreatedFrom(name);
-
-      return {
-        name,
-        date: lastCommitDate,
-        createdAt: firstCommitDate,
-        createdFrom
-      };
-    } catch (error) {
-      console.error(`Error getting info for branch ${name}: ${error.message}`);
-      return { name, date: '', createdAt: '', createdFrom: '' };
+    if (Date.now() - branchesCacheTS > BRANCH_CACHE_TTL) {
+      // refresh asynchronously but wait briefly to avoid returning stale empty data first-time
+      await refreshBranchesCache();
     }
-  });
-}
-
-let cachedBranches = [];
-let lastCacheTime = 0;
-const CACHE_TTL_MS = 30 * 1000; // 30 seconds
-
-function refreshCache() {
-  try {
-    cachedBranches = getBranchesWithCreationDate();
-    lastCacheTime = Date.now();
-    console.log(`[Cache] Updated with ${cachedBranches.length} branches.`);
+    // sort by date (reflog date or createdAt)
+    const sorted = [...cachedBranches].sort((a, b) => {
+      const da = new Date(a.date || a.createdAt || 0).getTime();
+      const db = new Date(b.date || b.createdAt || 0).getTime();
+      return db - da;
+    });
+    res.json(sorted);
   } catch (err) {
-    console.error('[Cache] Failed to refresh:', err);
+    console.error('/branches error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Failed to list branches' });
   }
-}
-
-// Initial cache refresh and set interval
-refreshCache();
-setInterval(refreshCache, CACHE_TTL_MS);
-
-/** ------------ Branch endpoints ----------------- **/
-
-app.get('/branches', (req, res) => {
-  console.log('GET /branches hit');
-  if (Date.now() - lastCacheTime > CACHE_TTL_MS) refreshCache();
-  const sorted = [...cachedBranches].sort((a, b) =>
-    (b.date ?? '').localeCompare(a.date ?? '')
-  );
-  res.json(sorted);
 });
 
-app.get('/search-branches', (req, res) => {
-  console.log('GET /search-branches hit');
-  if (Date.now() - lastCacheTime > CACHE_TTL_MS) refreshCache();
-  const q = (req.query.q || '').toLowerCase();
-  if (!q) return res.json(cachedBranches);
-  const filtered = cachedBranches.filter(
-    (branch) =>
-      branch.name.toLowerCase().includes(q) ||
-      (branch.date || '').toLowerCase().includes(q) ||
-      (branch.createdAt || '').toLowerCase().includes(q)
-      
-  );
-  res.json(filtered);
+/** /search-branches?q= - filter cached branches */
+app.get('/search-branches', async (req, res) => {
+  try {
+    const q = (req.query.q || '').toString().trim().toLowerCase();
+    if (Date.now() - branchesCacheTS > BRANCH_CACHE_TTL) await refreshBranchesCache();
+    if (!q) return res.json(cachedBranches);
+    const filtered = cachedBranches.filter(b =>
+      b.name.toLowerCase().includes(q) ||
+      (b.date || '').toLowerCase().includes(q) ||
+      (b.createdAt || '').toLowerCase().includes(q)
+    );
+    res.json(filtered);
+  } catch (err) {
+    console.error('/search-branches error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Search failed' });
+  }
 });
 
-app.post('/delete-branch', (req, res) => {
-  console.log('POST /delete-branch hit');
-  const { branch } = req.body;
-  if (!branch || !/^[\w\-_/]+$/.test(branch)) {
-    return res.status(400).json({ error: 'Invalid branch name.' });
-  }
-  exec(`git branch -D ${branch}`, { cwd: repoPath }, (err, stdout, stderr) => {
-    if (err) {
-      console.error(`Error deleting branch ${branch}: ${stderr || err.message}`);
-      return res.status(500).json({ error: stderr || err.message });
+/** /delete-branch - body: {branch} */
+app.post('/delete-branch', async (req, res) => {
+  try {
+    const branch = (req.body.branch || '').toString();
+    if (!branch || !/^[\w\-_/]+$/.test(branch)) {
+      return res.status(400).json({ success: false, error: 'Invalid branch name.' });
     }
-    console.log(`Branch ${branch} deleted.`);
-    refreshCache();
-    res.json({ success: true, message: stdout });
-  });
+    // Use -D with proper escaping
+    await execGit(`git branch -D ${shellEscapeArg(branch)}`, repoPath);
+    await refreshBranchesCache();
+    res.json({ success: true, message: `Branch ${branch} deleted.` });
+  } catch (err) {
+    console.error('/delete-branch error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Failed to delete branch' });
+  }
 });
 
+/** /ts-file-stats?branch= - show stats for last 3 commits */
+app.get('/ts-file-stats', async (req, res) => {
+  try {
+    const branch = (req.query.branch || 'HEAD').toString();
+    if (!/^[\w\-\/]+$/.test(branch)) return res.status(400).json({ error: 'Invalid branch name.' });
 
-
-app.get('/ts-file-stats', (req, res) => {
-  console.log('GET /ts-file-stats hit');
-  const branch = req.query.branch || 'HEAD';
-  if (!/^[\w\-\/]+$/.test(branch)) {
-    return res.status(400).json({ error: 'Invalid branch name.' });
-  }
-  const cmd = `git log -n 3 --numstat --pretty=format: ${branch}`;
-  
-  exec(cmd, { cwd: repoPath }, (error, stdout, stderr) => {
-    if (error) {
-      console.error(`Error fetching ts-file-stats for ${branch}: ${stderr || error.message}`);
-      return res.status(500).json({ error: stderr || error.message });
-    }
+    const cmd = `git log -n 3 --numstat --pretty=format: ${shellEscapeArg(branch)}`;
+    const { stdout } = await execGit(cmd, repoPath);
     const lines = stdout.trim().split('\n').filter(Boolean);
     const statsMap = {};
-    lines.forEach((line) => {
+    for (const line of lines) {
       const parts = line.trim().split(/\s+/);
-      if (parts.length < 3) return;
+      if (parts.length < 3) continue;
       const [addedStr, deletedStr, file] = parts;
-      if (!file.endsWith('.ts')) return;
+      if (!file.endsWith('.ts')) continue;
       const added = addedStr === '-' ? 0 : parseInt(addedStr, 10);
       const deleted = deletedStr === '-' ? 0 : parseInt(deletedStr, 10);
       if (!statsMap[file]) statsMap[file] = { added: 0, deleted: 0 };
-      statsMap[file].added += added;
-      statsMap[file].deleted += deleted;
-    });
+      statsMap[file].added += (Number.isNaN(added) ? 0 : added);
+      statsMap[file].deleted += (Number.isNaN(deleted) ? 0 : deleted);
+    }
     const result = Object.entries(statsMap).map(([file, { added, deleted }]) => ({
-      file,
-      added,
-      deleted,
-      net: added - deleted,
+      file, added, deleted, net: added - deleted
     }));
-    // Always return 200, even if empty array
-    if (result.length === 0) {
-      console.log(`No ts-file-stats found for ${branch}`);
-      return res.status(200).json([]); // Return empty array, not 404
-    }
-    console.log(`Ts-file-stats fetched for ${branch}`);
     res.json(result);
-  });
-});
-
-// Example: app.listen...
-
-/** ------------ Create Branch: /create-branch ------------ **/
-
-app.post('/create-branch', (req, res) => {
-  console.log('POST /create-branch hit');
-  const { remoteRepo, targetBranch, branchName } = req.body;
-  if (![remoteRepo, targetBranch, branchName].every(Boolean)) {
-    return res.status(400).json({ error: 'Missing remoteRepo, targetBranch, or branchName.' });
+  } catch (err) {
+    console.error('/ts-file-stats error:', err.message || err);
+    res.status(500).json({ error: err.message || 'Failed to compute ts-file-stats' });
   }
-  const now = new Date();
-  const month = now.toLocaleString('en-US', { month: 'long' });
-  const day = String(now.getDate()).padStart(2, '0');
-  const newBranch = `${branchName}_${remoteRepo}_${month}_${day}`;
-
-  // Step 1: git fetch remote
-  exec(`git fetch ${remoteRepo}`, { cwd: repoPath }, (fetchErr) => {
-    if (fetchErr) {
-      console.error(`git fetch failed for ${remoteRepo}: ${fetchErr.message}`);
-      return res.status(500).json({ error: `git fetch failed: ${fetchErr.message}` });
-    }
-    console.log(`git fetch ${remoteRepo} successful.`);
-
-    // Step 2: Verify remote branch exists
-    exec(
-      `git show-ref --verify --quiet refs/remotes/${remoteRepo}/${targetBranch}`,
-      { cwd: repoPath },
-      (refErr) => {
-        if (refErr) {
-          console.error(`Remote branch ${remoteRepo}/${targetBranch} does not exist.`);
-          return res.status(400).json({ error: `Remote branch ${remoteRepo}/${targetBranch} does not exist.` });
-        }
-        console.log(`Remote branch ${remoteRepo}/${targetBranch} verified.`);
-
-        // Step 3: Create and checkout new branch from remote branch
-        exec(
-          `git checkout -b ${newBranch} ${remoteRepo}/${targetBranch}`,
-          { cwd: repoPath },
-          (checkoutErr) => {
-            if (checkoutErr) {
-              console.error(`Branch creation failed for ${newBranch}: ${checkoutErr.message}`);
-              return res.status(500).json({ error: `Branch creation failed: ${checkoutErr.message}` });
-            }
-            console.log(`Branch ${newBranch} created and checked out.`);
-
-            // Refresh cache after successful branch creation
-            try {
-              refreshCache();
-              console.log('Cache refreshed after branch creation.');
-            } catch (cacheErr) {
-              console.error('Cache refresh failed after branch creation:', cacheErr);
-            }
-
-            return res.json({
-              success: true,
-              branch: newBranch,
-              message: `Branch ${newBranch} created and checked out successfully after fetching every time.`,
-            });
-          }
-        );
-      }
-    );
-  });
 });
 
-
-/** ----------- Pull ----------- **/
-
-app.post('/pull-and-pnpm', async (req, res) => {
-  console.log('POST /pull-and-pnpm hit');
+/** /create-branch - body: { remoteRepo, targetBranch, branchName } */
+app.post('/create-branch', async (req, res) => {
   try {
-    // 1. Get current branch
-    const { stdout: curBranchStdout } = await execAsync('git branch --show-current', { cwd: repoPath });
+    const { remoteRepo, targetBranch, branchName } = req.body;
+    if (![remoteRepo, targetBranch, branchName].every(Boolean)) {
+      return res.status(400).json({ error: 'Missing remoteRepo, targetBranch, or branchName.' });
+    }
+    // validate simple names
+    if (!/^[\w\-]+$/.test(remoteRepo) || !/^[\w\-\/]+$/.test(targetBranch) || !/^[\w\-]+$/.test(branchName)) {
+      return res.status(400).json({ error: 'Invalid characters in input.' });
+    }
+
+    // Building branch suffix with month/day (English)
+    const now = new Date();
+    const month = now.toLocaleString('en-US', { month: 'long' });
+    const day = String(now.getDate()).padStart(2, '0');
+    const newBranch = `${branchName}_${remoteRepo}_${month}_${day}`;
+
+    await execGit(`git fetch ${shellEscapeArg(remoteRepo)}`, repoPath);
+
+    // verify remote branch exists
+    try {
+      await execGit(`git show-ref --verify --quiet refs/remotes/${remoteRepo}/${targetBranch}`, repoPath);
+    } catch (err) {
+      return res.status(400).json({ error: `Remote branch ${remoteRepo}/${targetBranch} does not exist.` });
+    }
+
+    // create and checkout new branch
+    await execGit(`git checkout -b ${shellEscapeArg(newBranch)} ${shellEscapeArg(`${remoteRepo}/${targetBranch}`)}`, repoPath);
+
+    // Refresh cache
+    await refreshBranchesCache();
+
+    res.json({
+      success: true,
+      branch: newBranch,
+      message: `Branch ${newBranch} created and checked out successfully.`,
+    });
+  } catch (err) {
+    console.error('/create-branch error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Failed to create branch' });
+  }
+});
+
+/** /pull-and-pnpm - pulls tracked upstream for current branch */
+app.post('/pull-and-pnpm', async (req, res) => {
+  try {
+    // 1. current branch
+    const { stdout: curBranchStdout } = await execGit('git branch --show-current', repoPath);
     const current_branch = curBranchStdout.trim();
-    console.log(`Current branch: ${current_branch}`);
+    if (!current_branch) return res.status(500).json({ success: false, message: 'Could not determine current branch.' });
 
-    // 2. Get tracking info using 'git branch -vv'
-    const { stdout: branchesStdout } = await execAsync('git branch -vv', { cwd: repoPath });
-    console.log(`git branch -vv output:\n${branchesStdout}`);
-
-    // 3. Extract tracking remote/branch
+    // 2. get tracking info (git branch -vv)
+    const { stdout: branchesStdout } = await execGit('git branch -vv', repoPath);
     const lines = branchesStdout.split('\n');
     let remote_branch_info = '';
     for (const line of lines) {
@@ -436,34 +486,33 @@ app.post('/pull-and-pnpm', async (req, res) => {
 
     let remote_name = '', branch_name = '';
     if (remote_branch_info) {
-      remote_name = remote_branch_info.split('/')[0];
-      branch_name = remote_branch_info.split('/').slice(1).join('/');
-      console.log(`Pulling changes from remote: ${remote_name}, branch: ${branch_name}`);
-    } else {
-      console.log('Current branch is not tracking a remote branch.');
-    }
-
-    // 4. If branch is tracking a remote, pull from it
-    let pullOutput = '', errorMsg = '';
-    if (remote_branch_info) {
-      try {
-        console.log(`Executing: git pull ${remote_name} ${branch_name}`);
-        const { stdout } = await execAsync(`git pull ${remote_name} ${branch_name}`, { cwd: repoPath });
-        pullOutput = stdout.trim();
-        console.log(`Git pull successful:\n${pullOutput}`);
-      } catch (e) {
-        errorMsg = e.stderr || e.message;
-        console.error(`Error during git pull: ${errorMsg}`);
+      const idx = remote_branch_info.indexOf('/');
+      if (idx >= 0) {
+        remote_name = remote_branch_info.slice(0, idx);
+        branch_name = remote_branch_info.slice(idx + 1);
       }
     }
 
-    // 5. Compose response with polished pull message
+    let pullResult = '';
+    let errorMsg = '';
+    if (remote_branch_info) {
+      try {
+        const { stdout } = await execGit(`git pull ${shellEscapeArg(remote_name)} ${shellEscapeArg(branch_name)}`, repoPath);
+        pullResult = stdout.trim();
+      } catch (e) {
+        errorMsg = e.message || e;
+      }
+    }
+
+    // Optionally run pnpm install (uncomment if desired)
+    // const { stdout: pnpmOut } = await execGit('pnpm install', repoPath);
+
     let message = '';
     if (remote_branch_info) {
       if (errorMsg) {
-        message = `Failed to pull changes into branch "${current_branch}" from remote branch "${remote_name}/${branch_name}". Error: ${errorMsg}`;
+        message = `Failed to pull changes into branch "${current_branch}" from remote "${remote_name}/${branch_name}". Error: ${errorMsg}`;
       } else {
-        message = `Successfully pulled changes into branch "${current_branch}" from remote branch "${remote_name}/${branch_name}".`;
+        message = `Successfully pulled changes into branch "${current_branch}" from remote "${remote_name}/${branch_name}".`;
       }
     } else {
       message = `Branch "${current_branch}" is not tracking any remote branch. Pull skipped.`;
@@ -477,21 +526,18 @@ app.post('/pull-and-pnpm', async (req, res) => {
       branch_name,
       message,
       git_branch_vv: branchesStdout,
+      pullResult
     });
   } catch (err) {
-    console.error('Server-side error in /pull-and-pnpm:', err.stderr || err.message);
-    res.status(500).json({ success: false, message: err.stderr || err.message });
+    console.error('/pull-and-pnpm error:', err.message || err);
+    res.status(500).json({ success: false, message: err.message || 'pull failed' });
   }
 });
 
-
-
-/** --------------- Cypress Automation /run-automation -------------- **/
-
-
+/** /run-automation - start cypress via Terminal (macOS) */
 app.post('/run-automation', async (req, res) => {
   try {
-    // Accept both an array or single string for specPath(s)
+    // Accept either specPaths array or specPath string
     const specs = Array.isArray(req.body.specPaths)
       ? req.body.specPaths
       : (typeof req.body.specPath === 'string' ? [req.body.specPath] : []);
@@ -499,254 +545,164 @@ app.post('/run-automation', async (req, res) => {
       return res.status(400).json({ success: false, error: "No spec filename(s) provided." });
     }
 
-    // Join for Cypress CLI
     const joinedSpecs = specs.join(',');
-    const cdDir = '/Users/agorthi/Downloads/repo/manager';
+    const cdDir = repoPath; // use configured repoPath
     const cyCommand = [
-      `cd '${cdDir}'`,
-      `pnpm cy:run -s "${joinedSpecs}"`,
+      `cd ${shellEscapeArg(cdDir)}`,
+      `pnpm cy:run -s ${shellEscapeArg(joinedSpecs)}`,
       `echo`,
       `echo "[Cypress finished. Press Enter to close.]"`,
       `read`
     ].join(' && ');
 
-    // Escape double quotes for AppleScript only
-    const appleScriptCmd = `osascript -e 'tell application "Terminal" to do script "${cyCommand.replace(/"/g, '\\"')}"'`;
+    // Escape double quotes for AppleScript
+    const appleScriptCmd = `osascript -e ${shellEscapeArg(`tell application "Terminal" to do script "${cyCommand.replace(/"/g, '\\"')}"`)}`;
 
-    // Print out for debugging - you may copy-paste this in Terminal for instant feedback
-    console.log("osascript command:\n", appleScriptCmd);
-
-    exec(appleScriptCmd, (error, stdout, stderr) => {
+    // Launch terminal (macOS)
+    execCb(appleScriptCmd, (error, stdout, stderr) => {
       if (error) {
-        console.error(`Error launching Cypress:`, stderr || error.message);
+        console.error('osascript error:', stderr || error.message);
         return res.status(500).json({ success: false, error: stderr || error.message });
       }
-      return res.json({
-        success: true,
-        message: 'Cypress test(s) launched in a new Terminal window.',
-        filesRun: specs
-      });
+      return res.json({ success: true, message: 'Cypress test(s) launched in a new Terminal window.', filesRun: specs });
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error('/run-automation error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Failed to launch automation' });
   }
 });
 
-
-
-
-/** --------------- Start Service: /start-service --------------- **/
-
-
+/** /start-service - spawn dev server in new Terminal (macOS) */
 app.get('/start-service', (req, res) => {
-  console.log('GET /start-service endpoint hit!');
-  res.json({ success: true, message: "We are in progress..." });
-  console.log('Sent immediate "in progress" response.');
+  try {
+    res.json({ success: true, message: "Launching dev commands in a new Terminal window..." });
 
-  // Use single quotes in your echo to avoid AppleScript interpretation issues
-  const devCommand = [
-    `cd '${repoPath}'`,
-    'lsof -ti:3000 | xargs kill -9',
-    `pnpm dev; echo; echo 'Dev server terminated. Press Enter to close.'; read`
-  ].join(' && ');
+    const devCommand = [
+      `cd ${shellEscapeArg(repoPath)}`,
+      'lsof -ti:3000 | xargs kill -9 || true',
+      `pnpm dev; echo; echo 'Dev server terminated. Press Enter to close.'; read`
+    ].join(' && ');
 
-  // Escape for AppleScript (escape \ and ")
-  function escapeAppleScript(str) {
-    return str.replace(/([\\"])/g, '\\$1');
-  }
+    function escapeAppleScriptStr(s) {
+      // escape backslashes and double quotes for AppleScript inline string
+      return s.replace(/([\\"])/g, '\\$1');
+    }
+    const script = escapeAppleScriptStr(devCommand);
+    const osaScriptCmd = `osascript -e "tell application \\"Terminal\\" to do script \\"${script}\\""`; 
 
-  const script = escapeAppleScript(devCommand);
-
-  const osaScriptCmd =
-    `osascript -e "tell application \\"Terminal\\" to do script \\"${script}\\""`; 
-
-  exec(
-    osaScriptCmd,
-    (err, stdout, stderr) => {
+    execCb(osaScriptCmd, (err, stdout, stderr) => {
       if (err) {
         console.error('Error launching terminal:', stderr || err.message);
       } else {
-        console.log('All pnpm commands, including dev, launched in new Terminal window (macOS).');
+        console.log('Dev terminal launched.');
       }
-    }
-  );
+    });
+  } catch (err) {
+    console.error('/start-service error:', err.message || err);
+  }
 });
 
-
-/** --------------- stash--------------- **/
-
-/** --------------- get-remote-bybranches--------------- **/
-
-
-app.get('/get-branches-tracking-remote', (req, res) => {
-  const remote = req.query.remote;
-
-  if (!remote) {
-    return res.status(400).json({
-      success: false,
-      message: "Missing required query parameter: 'remote'. Example: /get-branches-tracking-remote?remote=aclp"
-    });
-  }
-
-  const command = `git branch -vv | grep '${remote}/' | sed 's/^\\* //' | awk '{print $1}'`;
-  const start = Date.now();
-
-  exec(command, { cwd: repoPath, timeout: 10000 }, (error, stdout, stderr) => {
-    const duration = (Date.now() - start) / 1000;
-
-    if (error) {
-      console.error(`[ERROR] Failed to fetch branches for remote '${remote}':`, stderr || error.message);
-      return res.status(500).json({
-        success: false,
-        message: `Failed to fetch branches tracking remote '${remote}'. Please ensure the remote exists and git repo is valid.`,
-        error: stderr || error.message
-      });
+/** /get-branches-tracking-remote?remote=aclp */
+app.get('/get-branches-tracking-remote', async (req, res) => {
+  try {
+    const remote = (req.query.remote || '').toString();
+    if (!remote) {
+      return res.status(400).json({ success: false, message: "Missing required query parameter: 'remote'." });
     }
+    // Use git branch -vv and filter locally
+    const { stdout } = await execGit(`git branch -vv`, repoPath);
+    const lines = stdout.split('\n');
+    const branches = lines
+      .map(l => l.trim())
+      .filter(l => l.includes(`${remote}/`))
+      .map(l => {
+        // remove leading '* ' if present and return first token as branch name
+        const cleaned = l.replace(/^\* /, '');
+        const parts = cleaned.split(/\s+/);
+        return parts[0];
+      })
+      .filter(Boolean);
 
-    const branches = stdout
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean); // remove empty lines
+    const start = Date.now();
+    const duration = `${((Date.now() - start) / 1000).toFixed(2)}s`;
 
-    // *** FIX: Return message if no branches found ***
     if (branches.length === 0) {
-      return res.json({
-        success: false,
-        remote,
-        count: 0,
-        duration: `${duration}s`,
-        message: "No branches are found with the remote.",
-        branches: []
-      });
+      return res.json({ success: false, remote, count: 0, duration, message: 'No branches found for remote', branches: [] });
     }
-
-    console.log(`[INFO] Fetched ${branches.length} branches from remote '${remote}' in ${duration}s`);
-
-    res.json({
-      success: true,
-      remote,
-      count: branches.length,
-      duration: `${duration}s`,
-      message: `Fetched ${branches.length} branches tracking remote '${remote}' successfully.`,
-      branches
-    });
-  });
-});
-
-
-/** --------------- get-remote-names--------------- **/
-
-
-app.get('/get-remote-names', (req, res) => {
-  const command = 'git remote';
-
-  exec(command, { cwd: repoPath, timeout: 5000 }, (error, stdout, stderr) => {
-    if (error) {
-      console.error('[ERROR] Failed to fetch git remote names:', stderr || error.message);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch Git remote names.',
-        error: stderr || error.message
-      });
-    }
-
-    const remoteNames = stdout
-      .split('\n')
-      .map(name => name.trim())
-      .filter(Boolean); // remove empty lines
-
-    res.json({
-      success: true,
-      count: remoteNames.length,
-      message: 'Git remote names fetched successfully.',
-      remotes: remoteNames
-    });
-  });
-});
-
-/** --------------- get-remote-names--------------- **/
-
-
-/** --------------- get-remote-bybranches--------------- **/
-
-
-app.get('/stash', (req, res) => {
-  console.log('GET /stash hit');  // Changed to GET since your route says app.get
-
-  try {
-    exec('git stash', { cwd: repoPath }, (err, stdout, stderr) => {
-      if (err) {
-        console.error('[Stash] Error:', stderr || err.message);
-        return res.status(500).json({ error: stderr || err.message });
-      }
-      
-      // After stash success, get current branch name
-      exec('git rev-parse --abbrev-ref HEAD', { cwd: repoPath }, (err2, branchStdout, branchStderr) => {
-        if (err2) {
-          console.error('[Branch] Error:', branchStderr || err2.message);
-          return res.status(500).json({ error: branchStderr || err2.message });
-        }
-
-        refreshCache(); // if needed
-
-        const branchName = branchStdout.trim();
-        console.log(`Git stash completed on branch: ${branchName}`);
-
-        res.json({
-          success: true,
-          message: stdout.trim() || "Stash complete.",
-          branch: branchName
-        });
-      });
-    });
-  } catch (e) {
-    console.error('Exception in /stash:', e.message);
-    return res.status(500).json({ error: e.message });
+    res.json({ success: true, remote, count: branches.length, duration, message: `Fetched ${branches.length} branches`, branches });
+  } catch (err) {
+    console.error('/get-branches-tracking-remote error:', err.message || err);
+    res.status(500).json({ success: false, message: 'Failed to fetch branches for remote', error: err.message || err });
   }
 });
 
-app.get('/current-branch', (req, res) => {
+/** /get-remote-names - list remotes */
+app.get('/get-remote-names', async (req, res) => {
   try {
-    exec('git rev-parse --abbrev-ref HEAD', { cwd: repoPath }, (err, stdout, stderr) => {
-      if (err) {
-        console.error('Error getting current branch:', stderr || err.message);
-        return res.status(500).json({ error: stderr || err.message });
-      }
-
-      const branchName = stdout.trim();
-      res.json({ success: true, branch: branchName });
-    });
-  } catch (e) {
-      console.error('Exception in /current-branch:', e.message);
-      res.status(500).json({ error: e.message });
+    const remotes = await getRemotesAsync(repoPath);
+    res.json({ success: true, count: remotes.length, remotes, message: 'Git remote names fetched successfully.' });
+  } catch (err) {
+    console.error('/get-remote-names error:', err.message || err);
+    res.status(500).json({ success: false, message: 'Failed to fetch Git remote names.', error: err.message || err });
   }
 });
 
-app.post('/checkout-branch', (req, res) => {
-  const { branch } = req.body;
-  if (!branch) return res.status(400).json({ success: false, error: 'Branch name is required.' });
+/** /stash - stash changes */
+app.get('/stash', async (req, res) => {
+  try {
+    const { stdout } = await execGit('git stash', repoPath);
+    // After stash, get current branch
+    const { stdout: branchStdout } = await execGit('git rev-parse --abbrev-ref HEAD', repoPath);
+    const branchName = branchStdout.trim();
+    // Refresh branches cache optionally
+    refreshBranchesCache();
+    res.json({ success: true, message: stdout.trim() || 'Stash complete.', branch: branchName });
+  } catch (err) {
+    console.error('/stash error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Stash failed' });
+  }
+});
 
-  // Run git checkout command
-  exec(`git checkout ${branch}`, { cwd: repoPath }, (error, stdout, stderr) => {
-    if (error) {
-      console.error('Checkout Error:', stderr);
-      return res.status(500).json({ success: false, error: stderr || error.message });
-    }
-    console.log('Checkout Success:', stdout);
+/** /current-branch */
+app.get('/current-branch', async (req, res) => {
+  try {
+    const { stdout } = await execGit('git rev-parse --abbrev-ref HEAD', repoPath);
+    res.json({ success: true, branch: stdout.trim() });
+  } catch (err) {
+    console.error('/current-branch error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Failed to get current branch' });
+  }
+});
+
+/** /checkout-branch - body: { branch } */
+app.post('/checkout-branch', async (req, res) => {
+  try {
+    const branch = (req.body.branch || '').toString();
+    if (!branch) return res.status(400).json({ success: false, error: 'Branch name is required.' });
+    await execGit(`git checkout ${shellEscapeArg(branch)}`, repoPath);
+    await refreshBranchesCache();
     res.json({ success: true, message: `Checked out to branch "${branch}"` });
-  });
+  } catch (err) {
+    console.error('/checkout-branch error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Checkout failed' });
+  }
 });
 
-const managerPath = path.join(repoPath, 'packages/manager');
-const relRoot = 'cypress/e2e/core/cloudpulse';
-
-// CHANGE pattern to include ** for subfolders!
-app.get('/list-specs', (req, res) => {
-  glob(`${relRoot}/**/*.spec.{ts,js}`, { cwd: managerPath })
-    .then(files => res.json(files))
-    .catch(err => res.status(500).json({ error: err.message }));
+/** /list-specs - list cached specs */
+app.get('/list-specs', async (req, res) => {
+  try {
+    if (Date.now() - specsCacheTS > SPECS_CACHE_TTL) await refreshSpecsCache();
+    res.json(cachedSpecs);
+  } catch (err) {
+    console.error('/list-specs error:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Failed to fetch specs' });
+  }
 });
-// This must be the ONLY app.listen call in your entire application
+
+// Fallback root
+app.get('/', (req, res) => res.json({ success: true, message: 'Cloudpulse Git UI Backend running' }));
+
+// Single app.listen
 app.listen(port, () => {
-  console.log(`CloudpulseGitUI Backend Server listening on port ${port}`);
+  console.log(`CloudpulseGitUI Backend Server listening on port ${port} (repoPath=${repoPath})`);
 });
